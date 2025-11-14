@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterable, Tuple
 import urllib.parse
 
 import requests
@@ -387,6 +387,7 @@ STAMP_KEYWORDS = [
     "filed of record",
     "date and time of recording",
     "recordation",
+    "project",
 ]
 
 LEGAL_KEYWORDS = [
@@ -394,6 +395,7 @@ LEGAL_KEYWORDS = [
     "lot",
     "block",
     "subdivision",
+    "condominium",
     "phase i",
     "phase ii",
     "plat book",
@@ -410,6 +412,100 @@ COUNTY_PATTERNS = [
     re.compile(r"County\s+of\s+([A-Z][A-Za-z\s'-]+)", re.IGNORECASE),
     re.compile(r"([A-Z][A-Za-z\s'-]+)\s+County", re.IGNORECASE),
 ]
+
+COUNTY_NOISE_TOKENS = {
+    "official",
+    "records",
+    "record",
+    "recording",
+    "recorder",
+    "clerk",
+    "fees",
+    "fee",
+    "document",
+    "documents",
+    "assessor",
+    "dd",
+    "asy",
+    "department",
+    "state",
+    "of",
+    "in",
+    "processing",
+    "filing",
+    "cost",
+    "prepared",
+    "prep",
+    "return",
+    "vexa",
+    "jexa",
+    "subdivision",
+    "condominium",
+    "project",
+    "to",
+    "office",
+    "change",
+    "the",
+    "district",
+    "for",
+    "court",
+    "with",
+    "without",
+    "each",
+    "be",
+    "page",
+    "pages",
+    "plat",
+    "entry",
+    "instrument",
+    "number",
+    "doc",
+    "file",
+    "recorded",
+    "recordation",
+    "officials",
+    "board",
+    "commissioners",
+    "shall",
+    "hereby",
+    "this",
+    "that",
+    "county",
+}
+
+
+def score_county_candidate(candidate: str) -> int:
+    if not candidate:
+        return -999
+    tokens = re.findall(r"[A-Za-z]+", candidate.lower())
+    tokens = [token for token in tokens if token != "county"]
+    if not tokens:
+        return -999
+    non_noise = [token for token in tokens if token not in COUNTY_NOISE_TOKENS]
+    noise = len(tokens) - len(non_noise)
+    score = 30 - len(tokens) * 4
+    score += len(non_noise) * 3
+    score -= noise * 4
+    if len(non_noise) >= 2:
+        score += 2
+    first_name_tokens = {"jon", "john", "michael", "mike", "steve", "steven", "paul", "david", "jason", "mark", "matt", "ron", "ronald", "mary", "lisa", "james", "peter", "andrew", "susan", "rhonda"}
+    if len(non_noise) == 2 and non_noise[0] in first_name_tokens:
+        score -= 6
+    if len(non_noise) >= 3:
+        score -= 3
+    return score
+
+def pick_best_county(candidates: Iterable[str]) -> str:
+    best_candidate = ""
+    best_score = float("-inf")
+    for candidate in candidates:
+        if not candidate:
+            continue
+        score = score_county_candidate(candidate)
+        if score > best_score:
+            best_candidate = candidate
+            best_score = score
+    return best_candidate
 
 DATE_PATTERNS = [
     "%m/%d/%Y",
@@ -479,6 +575,10 @@ STATE_NAME_MAP = {
     "WY": "Wyoming",
 }
 
+STATE_NAMES = {name.lower() for name in STATE_NAME_MAP.values()}
+
+
+
 ORDINAL_SUFFIX_RE = re.compile(r"(\d{1,2})(st|nd|rd|th)", re.IGNORECASE)
 DATE_CANDIDATE_REGEX = re.compile(
     r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4}|\s+\d{4})|\d{4}-\d{2}-\d{2})",
@@ -513,6 +613,8 @@ def normalize_document_number(value: str) -> str:
     cleaned = clean_text(value)
     if not cleaned:
         return ""
+    if cleaned.upper() in {"N/A", "NA", "NONE"}:
+        return ""
     cleaned = re.sub(
         r"^(?:Document|Doc(?:ument)?|Recording|Instrument)\s*(?:Number|No\.?)?[:#\-\s]*",
         "",
@@ -538,6 +640,8 @@ def normalize_document_number(value: str) -> str:
 def normalize_date(value: str) -> str:
     cleaned = clean_text(value)
     if not cleaned:
+        return ""
+    if cleaned.upper() in {"N/A", "NA", "NONE"}:
         return ""
 
     match = re.search(
@@ -589,6 +693,8 @@ def normalize_party_names(value: str) -> str:
     cleaned = clean_text(value)
     if not cleaned:
         return ""
+    if cleaned.upper() in {"N/A", "NA", "NONE"}:
+        return ""
 
     cleaned = re.sub(r"\s*&\s*", " and ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;.")
@@ -608,6 +714,8 @@ def _expand_state_token(token: str) -> str:
 def normalize_address(value: str) -> str:
     cleaned = clean_text(value)
     if not cleaned:
+        return ""
+    if cleaned.upper() in {"N/A", "NA", "NONE"}:
         return ""
 
     cleaned = cleaned.strip(",;.")
@@ -641,48 +749,147 @@ def normalize_county(value: str) -> str:
     cleaned = clean_text(value)
     if not cleaned:
         return ""
+    if cleaned.upper() in {"N/A", "NA", "NONE"}:
+        return ""
 
     tokens = re.findall(r"[A-Za-z']+", cleaned)
     if not tokens:
-        return cleaned
+        return cleaned.title()
 
     lower_tokens = [token.lower() for token in tokens]
-    if "county" not in lower_tokens:
-        return cleaned.title()
+    if "county" in lower_tokens:
+        idx = len(lower_tokens) - 1 - lower_tokens[::-1].index("county")
+        name_tokens = tokens[:idx]
+    else:
+        idx = -1
+        name_tokens = tokens
 
-    idx = len(lower_tokens) - 1 - lower_tokens[::-1].index("county")
-    prefix_tokens = tokens[:idx]
-    stopwords = {"your", "homestead", "official", "records", "record", "recording", "county"}
+    filtered = [
+        token
+        for token in name_tokens
+        if token.lower() not in COUNTY_NOISE_TOKENS and len(token) > 1
+    ]
 
-    while prefix_tokens and prefix_tokens[0].lower() in stopwords:
-        prefix_tokens.pop(0)
+    if not filtered and name_tokens:
+        filtered = [token for token in name_tokens[-2:] if len(token) > 1]
 
-    name_tokens = []
-    for token in reversed(prefix_tokens):
-        lower = token.lower()
-        if lower in stopwords and name_tokens:
-            break
-        name_tokens.append(token)
-        if len(name_tokens) >= 4:
-            continue
-    name_tokens = list(reversed(name_tokens)) or prefix_tokens[-1:]
-    name_tokens = [token for token in name_tokens if token.lower() not in stopwords]
-    if not name_tokens and idx > 0:
-        name_tokens = [tokens[idx - 1]]
+    if not filtered and idx >= 0:
+        tail_tokens = tokens[idx + 1 :]
+        filtered = [
+            token
+            for token in tail_tokens
+            if token.lower() not in COUNTY_NOISE_TOKENS and len(token) > 1
+        ][:1]
 
-    cleaned = " ".join(name_tokens + ["County"])
+    filtered = filtered[-3:]
+    if len(filtered) > 1:
+        filtered = [token for token in filtered if token.lower() not in STATE_NAMES]
+        if not filtered and name_tokens:
+            filtered = [token for token in name_tokens[-1:] if len(token) > 1]
+    special_map = {"ff": "Fe"}
+    normalized_parts = [
+        special_map.get(token.lower(), token.title())
+        for token in filtered
+    ]
+    if normalized_parts:
+        deduped_parts = []
+        for part in normalized_parts:
+            if not deduped_parts or deduped_parts[-1] != part:
+                deduped_parts.append(part)
+        normalized_parts = deduped_parts
 
-    if not cleaned.lower().endswith("county"):
-        return cleaned.title()
+    if not normalized_parts:
+        normalized = cleaned.title()
+    else:
+        normalized = " ".join(normalized_parts)
 
-    cleaned = cleaned.title()
-    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    if not normalized:
+        return ""
+
+    if not normalized.lower().endswith("county"):
+        normalized = f"{normalized} County"
+    else:
+        normalized = re.sub(r"(?i)county$", "County", normalized)
+
+    normalized = re.sub(r"\s{2,}", " ", normalized).strip()
+    return normalized
+
+
+
+def normalize_city(value: str) -> str:
+    cleaned = clean_text(value)
+    if not cleaned:
+        return ""
+    if cleaned.upper() in {"N/A", "NA", "NONE"}:
+        return ""
+    cleaned = re.sub(
+        r"^(?:city|town|village|municipality)\s+of\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s+(?:city|town|village)$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned.title()
+
+
+def normalize_town(value: str) -> str:
+    cleaned = normalize_city(value)
+    if re.search(r"home", cleaned, flags=re.IGNORECASE):
+        return ""
     return cleaned
 
+
+def parse_address_components(address: str) -> Dict[str, str]:
+    cleaned = clean_text(address)
+    result = {"city": "", "state": "", "zip": ""}
+    if not cleaned:
+        return result
+
+    pattern = re.search(
+        r",\s*([A-Za-z .'-]+),\s*([A-Za-z]{2})(?:\s+(\d{5}(?:-\d{4})?))?",
+        cleaned,
+    )
+    if pattern:
+        city = normalize_city(pattern.group(1))
+        state_token = pattern.group(2).upper()
+        state = STATE_NAME_MAP.get(state_token, pattern.group(2).title())
+        zip_code = pattern.group(3) or ""
+        result.update({"city": city, "state": state, "zip": zip_code})
+        return result
+
+    parts = [part.strip() for part in cleaned.split(',') if part.strip()]
+    if len(parts) >= 2:
+        tail = parts[-1]
+        state = ""
+        zip_code = ""
+        abbr_match = re.search(r"([A-Za-z]{2})", tail)
+        if abbr_match:
+            state_token = abbr_match.group(1).upper()
+            if state_token in STATE_NAME_MAP:
+                state = STATE_NAME_MAP[state_token]
+        if not state:
+            for name in STATE_NAME_MAP.values():
+                if re.search(rf"{name}", tail, re.IGNORECASE):
+                    state = name
+                    break
+        if state:
+            zip_match = re.search(r"(\d{5}(?:-\d{4})?)", tail)
+            if zip_match:
+                zip_code = zip_match.group(1)
+            city = normalize_city(parts[-2])
+            result.update({"city": city, "state": state, "zip": zip_code})
+    return result
 
 def refine_borrower_text(value: str) -> str:
     cleaned = clean_text(value)
     if not cleaned:
+        return ""
+    if cleaned.upper() in {"N/A", "NA", "NONE"}:
         return ""
 
     stop_patterns = [
@@ -746,10 +953,39 @@ def refine_borrower_text(value: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     )
+    cleaned = re.sub(
+        r",?\s*(?:wife|husband)\b.*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s+joint\s+tenants?.*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s+with\s+rights?\s+of\s+survivorship.*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
 
     cleaned = cleaned.strip(" ,.;")
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     return cleaned
+def is_multi_party(value: str) -> bool:
+    if not value:
+        return False
+    upper = value.upper()
+    if re.search(r"\bAND\b", upper):
+        return True
+    if "," in value or "&" in value:
+        return True
+    words = [word for word in re.split(r"[\s,]+", upper) if word]
+    person_like = [word for word in words if word and word[0].isalpha() and len(word) > 2]
+    return len(person_like) >= 2
 
 
 def standardize_for_validation(label: str, value: str) -> str:
@@ -823,7 +1059,10 @@ def values_match(label: str, doc_value: str, client_value: str) -> bool:
     return doc_norm == client_norm
 
 
-def fallback_borrower(lines: List[str], full_text: str) -> str:
+def fallback_borrower(
+    lines: List[str],
+    full_text: str,
+) -> str:
     candidates: List[str] = []
 
     pattern_borrower = re.compile(
@@ -843,7 +1082,7 @@ def fallback_borrower(lines: List[str], full_text: str) -> str:
         candidates.append(match.group(1))
 
     for idx, line in enumerate(lines):
-        if re.search(r"\bBorrower\b", line, re.IGNORECASE):
+        if re.search(r"\\bBorrower\\b", line, re.IGNORECASE):
             snippet = " ".join(lines[idx : idx + 3])
             match = pattern_borrower.search(snippet)
             if match:
@@ -853,7 +1092,7 @@ def fallback_borrower(lines: List[str], full_text: str) -> str:
             candidates.append(line.split("(Seal)", 1)[0])
 
         between_match = re.search(
-            r"between\s+([A-Za-z0-9 ,\.'/&-]+?)\s+(?:the\s+person|the\s+persons)\s+signing\s+as\s+\"Borrower",
+            r"between\s+([A-Za-z0-9 ,\.'/&-]+?)\s+(?:the\s+person|the\s+persons)\s+signing\s+as\s+\"Borrower\"",
             line,
             flags=re.IGNORECASE,
         )
@@ -868,14 +1107,27 @@ def fallback_borrower(lines: List[str], full_text: str) -> str:
         if to_borrower_match:
             candidates.append(to_borrower_match.group(1))
 
-    bad_keywords = [
+    bad_keywords = {
         "PROMISES AND AGREEMENTS",
         "UNDER THIS SECURITY",
         "UNDER THE HOME",
         "APPLICABLE LAW",
         "PAYMENT OF PRINCIPAL",
         "FEES FOR SERVICES",
-    ]
+        "ESCROW",
+        "PUD",
+        "PAYMENT",
+        "BORROWER",
+        "FUNDS",
+        "MISCELLANEOUS",
+        "EXTENSION",
+        "CREDIT",
+        "SECURITY",
+        "HOMESTEAD",
+        "LENDER",
+        "DEED",
+        "NOTE",
+    }
 
     refined_candidates: List[str] = []
 
@@ -889,14 +1141,20 @@ def fallback_borrower(lines: List[str], full_text: str) -> str:
         refined_candidates.append(refined)
 
     if refined_candidates:
+        prioritized = [c for c in refined_candidates if is_multi_party(c)]
+        if prioritized:
+            return min(prioritized, key=len)
         return min(refined_candidates, key=len)
 
     for candidate in candidates:
         refined = refine_borrower_text(candidate)
-        if refined:
-            return refined
+        if not refined:
+            continue
+        upper = refined.upper()
+        if len(refined) > 180 or any(keyword in upper for keyword in bad_keywords):
+            continue
+        return refined
     return ""
-
 
 def collect_stamp_lines(text_data: Dict[str, Any]) -> List[str]:
     pages = text_data.get("pages") or []
@@ -933,53 +1191,63 @@ def collect_stamp_lines(text_data: Dict[str, Any]) -> List[str]:
 
 
 def find_county_mentions(line: str) -> List[str]:
-    matches: List[str] = []
+    results: List[Tuple[int, str]] = []
+    seen: set[str] = set()
     normalized_line = line.replace("\u2019", "'")
-    stop_words = {"THE", "FOLLOWING", "DESCRIBED", "PROPERTY", "LOCATED", "IN", "OF"}
 
     for pattern in COUNTY_PATTERNS:
         for match in pattern.finditer(normalized_line):
             raw = match.group(1).strip() if match.groups() else ""
             if not raw:
                 continue
-            parts = [part for part in re.split(r"\s+", raw.upper()) if part]
-            filtered: List[str] = []
-            for part in reversed(parts):
-                if part in stop_words:
-                    continue
-                filtered.append(part)
-                if len(filtered) >= 3:
-                    break
-            if not filtered:
+            candidate = clean_text(raw)
+            if not candidate:
                 continue
-            candidate = " ".join(reversed(filtered)).title().strip()
-            if candidate and f"{candidate} County" not in matches:
-                matches.append(f"{candidate} County")
-    return matches
+            if not candidate.lower().endswith("county"):
+                candidate = f"{candidate} County"
+            normalized = normalize_county(candidate)
+            if not normalized or normalized in seen:
+                continue
+            score = score_county_candidate(normalized)
+            results.append((score, normalized))
+            seen.add(normalized)
+
+    results.sort(key=lambda item: item[0], reverse=True)
+    return [value for _, value in results]
 
 
 def extract_county_from_stamp(lines: List[str]) -> Optional[str]:
+    best_candidate = ""
+    best_score = float("-inf")
     for idx, line in enumerate(lines):
         lower_line = line.lower()
         if any(keyword in lower_line for keyword in STAMP_KEYWORDS) or "county" in lower_line:
-            window = lines[idx : idx + 3]
+            window = lines[max(0, idx - 1) : idx + 4]
             for candidate_line in window:
-                matches = find_county_mentions(candidate_line)
-                if matches:
-                    return matches[0]
-    return None
+                for candidate in find_county_mentions(candidate_line):
+                    score = score_county_candidate(candidate)
+                    if score > best_score:
+                        best_score = score
+                        best_candidate = candidate
+    return best_candidate or None
+
 
 
 def extract_county_from_legal_description(lines: List[str]) -> Optional[str]:
+    best_candidate = ""
+    best_score = float("-inf")
     for idx, line in enumerate(lines):
         lower_line = line.lower()
         if any(keyword in lower_line for keyword in LEGAL_KEYWORDS):
             window = lines[max(0, idx - 2) : idx + 3]
             for candidate_line in window:
-                matches = find_county_mentions(candidate_line)
-                if matches:
-                    return matches[0]
-    return None
+                for candidate in find_county_mentions(candidate_line):
+                    score = score_county_candidate(candidate)
+                    if score > best_score:
+                        best_score = score
+                        best_candidate = candidate
+    return best_candidate or None
+
 
 
 def extract_recording_dates(lines: List[str]) -> List[str]:
@@ -1296,18 +1564,25 @@ def sanitize_amount(value: str) -> str:
     return cleaned
 
 
-def extract_section(lines: List[str], start_keywords: List[str], max_lines: int = 6) -> str:
+def extract_section(lines: List[str], start_keywords: List[str], max_lines: int = 10) -> str:
     for idx, line in enumerate(lines):
         lower_line = line.lower()
         if any(keyword in lower_line for keyword in start_keywords):
             section_lines: List[str] = []
+            blank_streak = 0
             for offset in range(1, max_lines + 1):
                 if idx + offset >= len(lines):
                     break
-                candidate = clean_text(lines[idx + offset])
-                if not candidate:
+                raw_line = clean_text(lines[idx + offset])
+                if not raw_line:
+                    blank_streak += 1
+                    if blank_streak >= 2:
+                        break
+                    continue
+                blank_streak = 0
+                if re.search(r"\bpage\s+\d+\s+of\s+\d+\b", raw_line, flags=re.IGNORECASE):
                     break
-                section_lines.append(candidate)
+                section_lines.append(raw_line)
             return clean_text(" ".join(section_lines))
     return ""
 
@@ -1398,25 +1673,33 @@ def extract_recording_information(text_data: Dict[str, Any]) -> Dict[str, str]:
         candidate = extract_first_match(candidate_text, county_patterns)
         if candidate:
             matches = find_county_mentions(candidate)
-            if matches:
-                county = matches[0]
+            best_match = pick_best_county(matches)
+            if best_match:
+                county = best_match
                 break
     if not county:
-        county = extract_value_from_lines(
+        raw_county = extract_value_from_lines(
             search_lines if search_lines else lines,
             [" county"],
             r"([A-Za-z\s]+)",
         )
-        matches = find_county_mentions(county)
-        if matches:
-            county = matches[0]
+        matches = find_county_mentions(raw_county)
+        county = pick_best_county(matches)
+        if not county:
+            county = normalize_county(raw_county)
 
     stamp_county = extract_county_from_stamp(stamp_lines if stamp_lines else lines)
     legal_county = extract_county_from_legal_description(lines)
+
+    candidate_pool: List[str] = []
     if stamp_county:
-        county = stamp_county
-    elif not county and legal_county:
-        county = legal_county
+        candidate_pool.append(stamp_county)
+    if county:
+        candidate_pool.append(county)
+    if legal_county:
+        candidate_pool.append(legal_county)
+
+    county = pick_best_county(candidate_pool) or county
     county = normalize_county(county)
 
     recorder_clerk_name = ""
@@ -1433,37 +1716,52 @@ def extract_recording_information(text_data: Dict[str, Any]) -> Dict[str, str]:
             if recorder_clerk_name:
                 break
 
-    book_volume = extract_first_match(
+    raw_book_volume = extract_first_match(
         search_text,
         [
             r"Book[:\s]*([A-Za-z0-9\-]+)",
             r"Volume[:\s]*([A-Za-z0-9\-]+)",
         ],
     )
-    if not book_volume and secondary_text:
-        book_volume = extract_first_match(
+    if not raw_book_volume and secondary_text:
+        raw_book_volume = extract_first_match(
             secondary_text,
             [
                 r"Book[:\s]*([A-Za-z0-9\-]+)",
                 r"Volume[:\s]*([A-Za-z0-9\-]+)",
             ],
         )
-    if book_volume and not re.search(r"\d", book_volume):
+    if raw_book_volume and not re.search(r"\d", raw_book_volume):
+        raw_book_volume = ""
+
+    book_volume = clean_text(raw_book_volume)
+    if book_volume.upper() in {"N/A", "NA", "NONE"}:
         book_volume = ""
 
-    page_number = extract_first_match(
-        search_text,
-        [
-            r"Page[:\s]*([A-Za-z0-9\-]+)",
-        ],
-    )
-    if not page_number and secondary_text:
-        page_number = extract_first_match(
-            secondary_text,
-            [
-                r"Page[:\s]*([A-Za-z0-9\-]+)",
-            ],
-        )
+    page_number = ""
+    total_pages_count = len(text_data.get("pages", []))
+
+    if book_volume:
+        page_patterns = [
+            r"#\s*Pages?\s+(\d+)",
+            r"Pages?\s*[:#]\s*(\d+)",
+            r"Page\s+\d+\s+of\s+(\d+)",
+            r"(\d+)\s+Pages\b",
+        ]
+        for candidate_text in filter(None, [search_text, secondary_text]):
+            candidate = extract_first_match(candidate_text, page_patterns)
+            if candidate:
+                page_number = candidate
+                break
+        if not page_number:
+            for line in search_lines:
+                match = re.search(r"Page\s+\d+\s+of\s+(\d+)", line, flags=re.IGNORECASE)
+                if match:
+                    page_number = match.group(1)
+                    break
+        if not page_number and total_pages_count:
+            page_number = str(total_pages_count)
+
     if page_number and not re.search(r"\d", page_number):
         page_number = ""
 
@@ -1523,6 +1821,7 @@ def extract_document_fields(text_data: Dict[str, Any], doc_type: str) -> Dict[st
             lambda text: bool(re.search(r"\bfees?\s+for\s+services\b", text, flags=re.IGNORECASE)),
             lambda text: bool(re.search(r"\bco-?signer\b", text, flags=re.IGNORECASE)),
             lambda text: bool(re.search(r"\bpromises?\s+and\s+agreements\b", text, flags=re.IGNORECASE)),
+            lambda text: not is_multi_party(text or ''),
         ]
         if any(trigger(borrower or "") for trigger in fallback_triggers):
             fallback_candidate = fallback_borrower(lines, full_text)
@@ -1595,6 +1894,8 @@ def extract_document_fields(text_data: Dict[str, Any], doc_type: str) -> Dict[st
             r"Property\s+Address[:\s]*([^\n\r]+)",
         ],
     )
+    address_components = {"city": "", "state": "", "zip": ""}
+
     if not propertyaddress:
         propertyaddress = extract_value_from_lines(
             lines,
@@ -1603,6 +1904,7 @@ def extract_document_fields(text_data: Dict[str, Any], doc_type: str) -> Dict[st
     if propertyaddress:
         propertyaddress = re.sub(r"\(\"Property Address\".*", "", propertyaddress).strip(" :\"")
         propertyaddress = normalize_address(propertyaddress)
+        address_components = parse_address_components(propertyaddress)
 
     county_hint = extract_first_match(
         full_text,
@@ -1613,8 +1915,11 @@ def extract_document_fields(text_data: Dict[str, Any], doc_type: str) -> Dict[st
     )
     if county_hint:
         matches = find_county_mentions(county_hint)
-        if matches:
-            county_hint = matches[0]
+        best_hint = pick_best_county(matches)
+        if best_hint:
+            county_hint = best_hint
+        else:
+            county_hint = normalize_county(county_hint)
 
     city = extract_first_match(
         full_text,
@@ -1623,7 +1928,9 @@ def extract_document_fields(text_data: Dict[str, Any], doc_type: str) -> Dict[st
             r"City[:\s]*([A-Za-z\s]+)",
         ],
     )
-    city = clean_text(city.title())
+    city = normalize_city(city)
+    if not city and address_components["city"]:
+        city = address_components["city"]
 
     town = extract_first_match(
         full_text,
@@ -1632,7 +1939,9 @@ def extract_document_fields(text_data: Dict[str, Any], doc_type: str) -> Dict[st
             r"Town[:\s]*([A-Za-z\s]+)",
         ],
     )
-    town = clean_text(town.title())
+    town = normalize_town(town)
+    if not town and not city and address_components["city"]:
+        town = address_components["city"]
 
     parcel_number = extract_first_match(
         full_text,
@@ -1656,7 +1965,7 @@ def extract_document_fields(text_data: Dict[str, Any], doc_type: str) -> Dict[st
     legal_description = extract_section(
         lines,
         ["legal description", "land referred to", "the land described", "legal description:"],
-        max_lines=8,
+        max_lines=14,
     )
 
     return {
@@ -1764,28 +2073,34 @@ def select_location(
     stamp_county = extract_county_from_stamp(lines)
     legal_county = extract_county_from_legal_description(lines)
     county_candidates = [
-        stamp_county,
         recording_info.get("county"),
+        stamp_county,
         extracted_fields.get("county_hint"),
         legal_county,
         client_data.get("override_county"),
         client_data.get("county"),
         client_data.get("expected_county"),
     ]
-    county = ""
-    for candidate in county_candidates:
-        if candidate:
-            county = normalize_county(candidate)
-            if county:
-                break
+    county = pick_best_county(candidate for candidate in county_candidates if candidate)
+    county = normalize_county(county)
 
-    city = extracted_fields.get("city") or client_data.get("city", "")
-    town = extracted_fields.get("town") or client_data.get("town", "")
+    property_address = extracted_fields.get("propertyaddress") or client_data.get("property_address", "")
+    address_components = parse_address_components(property_address)
+
+    city_value = extracted_fields.get("city") or client_data.get("city", "")
+    if not city_value:
+        city_value = address_components.get("city")
+    city_value = normalize_city(city_value)
+
+    town_value = extracted_fields.get("town") or client_data.get("town", "")
+    if not town_value and not city_value:
+        town_value = address_components.get("city")
+    town_value = normalize_town(town_value)
 
     return {
         "county": normalize_county(county),
-        "city": clean_text(city),
-        "town": clean_text(town),
+        "city": city_value,
+        "town": town_value,
     }
 
 
@@ -1999,3 +2314,9 @@ def select_pdf_with_stamp(
 
     logger.warning("No recording stamp detected across %s candidate documents.", len(pdf_paths))
     return {"error": "stamp is not present"}
+
+
+
+
+
+
